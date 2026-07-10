@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """trainer.py — TOUCH-FLIP-OUT PRO calibrator (BTC only).
 
-  python3 trainer.py --months 2026-05
-  python3 trainer.py --months 2026-04,2026-05     # more months = better verification
+  python3 trainer.py                              # default: Jan+Feb+Apr+May 2026
+  python3 trainer.py --months 2026-05             # single month (fast)
 
 Strategy needs no heavy models. This script:
  1. downloads BTC (+ETH,SOL for the side-picker) 1s klines from Binance Vision
@@ -150,11 +150,33 @@ def main(months):
         print(f'  cost {cost:.2f}: pnl/window {avg:+.4f}/share | holds {hw}W/{hl}L '
               f'({hw/max(hw+hl,1):.3f}) flips {fw}W/{fl}L ({fw/max(fw+fl,1):.3f}) '
               f'scratches {cls.get("scratch",0)}')
-    pickle.dump(dict(side_model=m, feats=list(df.columns), band_bp=int(BAND)),
+    # ---- no-leak 5m direction head (entry-gate model): tier table + save ----
+    y5 = []
+    for t0 in t0s:
+        cl = cb[t0+299]
+        y5.append(1 if np.isfinite(cl) and cl > cb[t0] else 0)
+    y5 = np.array(y5)
+    m5 = lgb.train(dict(objective='binary', verbosity=-1, learning_rate=0.03,
+                        num_leaves=31, min_data_in_leaf=80, lambda_l2=5.0, seed=7),
+                   lgb.Dataset(df.values[:k1], y5[:k1]), 1500,
+                   valid_sets=[lgb.Dataset(df.values[k1:k3], y5[k1:k3])],
+                   callbacks=[lgb.early_stopping(100, verbose=False)])
+    p5 = m5.predict(df.values)
+    conf = np.abs(p5[k3:] - 0.5); yte = y5[k3:]
+    print('\nno-leak 5m direction head (frozen test tiers):')
+    for q in (1.0, 0.5, 0.3, 0.15, 0.07):
+        kq = max(int(len(yte)*q), 1)
+        idx = np.argsort(-conf)[:kq]
+        a_ = ((p5[k3:][idx] > 0.5).astype(int) == yte[idx]).mean()
+        print(f'  top {q:>4.0%}: acc {a_:.4f} (n={kq})')
+    thr15 = float(np.quantile(np.abs(p5[k1:k3]-0.5), 0.85))
+    print(f'  MIN_CONF for ~top-15% tier: {thr15:.4f} (live gate value)')
+    pickle.dump(dict(side_model=m, feats=list(df.columns), band_bp=int(BAND),
+                     dir5_model=m5, dir5_conf15=thr15),
                 open('tfo_config.pkl', 'wb'))
     print('\nsaved tfo_config.pkl -> run: python3 live.py')
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('--months', default='2026-05')
+    ap.add_argument('--months', default='2026-01,2026-02,2026-04,2026-05')
     main([x.strip() for x in ap.parse_args().months.split(',')])
