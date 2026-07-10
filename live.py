@@ -21,6 +21,10 @@ import numpy as np
 import requests, websockets
 
 CFG = pickle.load(open('tfo_config.pkl', 'rb'))
+if os.environ.get('PAPER_MODE', '1') == '0' and os.environ.get('KEY_ROTATED', '') != 'YES':
+    raise SystemExit('LIVE MODE BLOCKED: your old private key was exposed in plaintext and is '
+                     'compromised. Create a NEW Polygon wallet, move funds, set POLY_PK to the new '
+                     'key, then set KEY_ROTATED=YES to confirm. Paper mode runs without this.')
 BAND_BP = int(os.environ.get('BAND_BP', CFG.get('band_bp', 3)))
 PAPER = os.environ.get('PAPER_MODE', '1') != '0'
 STAKE = float(os.environ.get('STAKE_USDC', '5'))
@@ -133,14 +137,17 @@ def clob_buy(token, usdc):
     o = _clob.create_market_order(MarketOrderArgs(token_id=token, amount=float(usdc), side='BUY'))
     return _clob.post_order(o, OrderType.FOK)
 
-def buy(token, label):
-    """Fetch real ask (the measurement), then paper-log or live-fill."""
+def buy(token, label, shares=None):
+    """Fetch real ask (the measurement), then paper-log or live FOK fill.
+    entry: spends STAKE USDC. flip/scratch: buys `shares` of the opposite token
+    (share-matched pair -> $1/share at resolution; no on-chain merge needed)."""
     a = ask(token)
     if a is None: return None, 'no_quote'
     if a > PRICE_CAP and label == 'entry': return a, 'skip_price'
     if PAPER: return a, 'paper'
     try:
-        clob_buy(token, STAKE)
+        usdc = STAKE if label == 'entry' else min(shares * a * 1.02, STAKE * 2.5)
+        clob_buy(token, usdc)
         return a, 'LIVE'
     except Exception as e:
         print('ORDER ERROR:', e); return a, 'order_failed'
@@ -215,7 +222,7 @@ async def engine():
                 q, status = buy(mkt['up' if up else 'down'], 'entry')
             active = status in ('paper', 'LIVE')
             win = dict(t0=sec, open=open_px, band=d, up=up, mkt=mkt, flips=0,
-                       entry=q, done=not active)
+                       entry=q, shares=(STAKE / q if q else 0.0), done=not active)
             ts = time.strftime('%H:%M:%S', time.localtime(sec))
             print(f'{ts} OPEN {"UP" if up else "DOWN"} @ {open_px:.1f} | entry ask {q} [{status}] band ±{d:.1f}')
             log(dict(ts=ts, window=sec, event='entry', side='UP' if up else 'DOWN',
@@ -231,7 +238,7 @@ async def engine():
         crossed_up = (not win['up']) and px >= op + d
         if crossed_dn or crossed_up:
             opp = win['mkt']['down' if win['up'] else 'up'] if win['mkt'] else None
-            q, status = buy(opp, 'flip') if opp else (None, 'no_market')
+            q, status = buy(opp, 'flip', win.get('shares', 0.0)) if opp else (None, 'no_market')
             ts = time.strftime('%H:%M:%S', time.localtime(sec))
             if win['flips'] == 0:
                 win['up'] = not win['up']; win['flips'] = 1
