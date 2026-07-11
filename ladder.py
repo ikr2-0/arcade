@@ -76,11 +76,24 @@ def place_limit(token, usdc):
     except Exception as e:
         print('ORDER ERROR:', e); return None
 def order_filled(oid):
-    if oid == 'paper': return True         # paper: assume maker fill at 0.50
+    if oid == 'paper': return True
     try:
         o = clob().get_order(oid)
-        return float(o.get('size_matched', 0)) > 0
-    except Exception: return False
+        if isinstance(o, dict):
+            for k in ('size_matched','sizeMatched','matched_amount','matchedAmount','filled_size','filledSize'):
+                v = o.get(k)
+                if v is not None and float(v) > 0: return True
+            s = str(o.get('status','')).upper()
+            if s in ('MATCHED','FILLED','COMPLETE','EXECUTED'): return True
+            if s in ('LIVE','OPEN','PENDING','UNMATCHED'): return False
+    except Exception as e:
+        print('get_order:', e)
+    # last resort: a filled order cannot be canceled
+    try:
+        clob().cancel(oid)
+        return False          # cancel succeeded -> it was resting -> unfilled
+    except Exception:
+        return True           # cancel refused -> already matched
 def cancel(oid):
     if oid and oid != 'paper':
         try: clob().cancel(oid)
@@ -115,7 +128,7 @@ async def engine():
         now = int(time.time())
         nxt = ((now//900)+1)*900
         await asyncio.sleep(max(1, nxt-now))
-        bank = balance() or (BANK0 + st['pnl'])
+        bank = BANK0 + st['pnl']   # balance() undercounts unredeemed wins; wire redeem later
         base = max(1.0, BASE_PCT*bank)
         losses = 0.0; won = False; st['cyc'] += 1
         for rung in (0,1,2):
@@ -133,7 +146,7 @@ async def engine():
                 cancel(oid); continue
             filled = order_filled(oid)
             if not filled:
-                cancel(oid)
+                pass  # cancel already attempted inside order_filled
                 log(dict(ts=time.strftime('%H:%M:%S'), cycle=st['cyc'], rung=rung+1,
                          event='unfilled', stake=round(stake,2), px='', pnl=0, total=round(st['pnl'],2)))
                 continue
@@ -147,7 +160,9 @@ async def engine():
             tg(f'{"✅" if win else "❌"} rung{rung+1} {"WIN" if win else "LOSS"} '
                f'stake ${stake:.2f} pnl {pnl:+.2f} | total ${st["pnl"]:.2f}')
             if win:
-                won = True; st['win'] += 1; st_save(st); break
+                won = True; st['win'] += 1; st_save(st)
+                tg('💰 WIN not auto-redeemed: claim it in Polymarket UI (Portfolio > Claim)')
+                break
             losses += stake
         if not won and losses > 0:
             tg(f'🔻 cycle {st["cyc"]} failed: -${losses:.2f} | reset to base | total ${st["pnl"]:.2f}')
