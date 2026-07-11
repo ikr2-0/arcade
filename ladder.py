@@ -121,14 +121,22 @@ def px_at(sec):
 
 async def engine():
     st = st_load()
+    if not PAPER:
+        try:
+            clob().cancel_all()
+            print('startup: canceled ALL resting orders (orphan sweep)')
+        except Exception as e:
+            print('orphan sweep failed:', e)
     print(f'LADDER | side={SIDE} limit={LIMIT_PX} base={BASE_PCT:.1%} target={TARGET:.0%}/cycle '
           f'| paper={PAPER} | pnl ${st["pnl"]:.2f}')
     tg(f'🪜 LADDER online | {SIDE}@{LIMIT_PX} | paper={PAPER}')
     while True:
         now = int(time.time())
         nxt = ((now//900)+1)*900
+        print(f'waiting for cycle boundary in {nxt-now}s ({time.strftime("%H:%M", time.localtime(nxt))})')
         await asyncio.sleep(max(1, nxt-now))
-        bank = BANK0 + st['pnl']   # balance() undercounts unredeemed wins; wire redeem later
+        b = balance()
+        bank = max(b or 0.0, BANK0 + st['pnl'])   # live balance when claimed; tracked pnl covers unredeemed
         base = max(1.0, BASE_PCT*bank)
         losses = 0.0; won = False; st['cyc'] += 1
         for rung in (0,1,2):
