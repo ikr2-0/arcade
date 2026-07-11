@@ -135,6 +135,7 @@ async def engine():
             t0 = nxt + rung*300
             stake = base if rung == 0 or not CARRY and losses == 0 else (losses + TARGET*base)
             if losses > 0: stake = losses + TARGET*base
+            stake = max(stake, 5 * LIMIT_PX * 1.02)   # exchange minimum 5 shares (~$2.55)
             mk = market(t0)
             oid = place_limit(mk[SIDE], stake) if mk else None
             log(dict(ts=time.strftime('%H:%M:%S'), cycle=st['cyc'], rung=rung+1,
