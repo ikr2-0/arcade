@@ -24,7 +24,7 @@ Usage:
   python froth_search.py                 # last 6 full months, all tickers
   python froth_search.py --months 8      # more history
 """
-import os, sys, io, zipfile, itertools, argparse, warnings, datetime as dt
+import os, sys, io, json, zipfile, itertools, argparse, warnings, datetime as dt
 import numpy as np, pandas as pd
 warnings.filterwarnings('ignore')
 try:
@@ -47,9 +47,8 @@ TICKERS  = ['BTCUSDT','ETHUSDT','SOLUSDT','DOGEUSDT','BNBUSDT','XRPUSDT']
 TKEY     = {'BTCUSDT':'B','ETHUSDT':'E','SOLUSDT':'S','DOGEUSDT':'G','BNBUSDT':'N','XRPUSDT':'X'}
 HORIZON  = 5            # minutes ahead (target = close[t+H] vs close[t])
 TOPK     = 3            # rules reported per target
-MAX_RULES= 10**9        # FULL EXHAUSTIVE — no cap
+MAX_RULES= 250          # cap on rule pool (exhaustive within cap)
 ITER     = 120          # catboost iterations
-SCREEN_KEEP = 600       # after raw TRAIN screen, fit CatBoost on this many rules (set 10**9 to disable screening)
 DATA_DIR = 'binance_data'
 BARS_DIR = 'bars_cache'
 BASE_URL = 'https://data.binance.vision/data/spot/monthly/aggTrades'
@@ -204,10 +203,6 @@ def rule_pool(P, train_mask):
         for k in P:
             if len(R)>=MAX_RULES: break
             R[f'{cn}&{k}up']=R[cn]&up[k]
-    # AND-triples (full exhaustive tier)
-    for a,b,c in itertools.combinations(base,3):
-        if len(R)>=MAX_RULES: break
-        R[f'{a}&{b}&{c}']=prims[a]&prims[b]&prims[c]
     return R
 
 # --------------------------- SEARCH ---------------------------
@@ -241,18 +236,9 @@ def main():
         y=np.where(fwd>TC,1,np.where(fwd<TC,0,-1))
         ok=okbase&(y>=0)
         scored=[]
-        # --- raw screen on TRAIN ONLY: rank rules by |short-accuracy - 0.5| with no model; VAL untouched ---
-        pre=[]
-        for rn,mask in R.items():
-            m=mask&ok; tr=m&(seg==0)
-            ntr=tr.sum()
-            if ntr<3000 or (m&(seg==1)).sum()<600: continue
-            raw=(y[tr]==0).mean()
-            pre.append((abs(raw-0.5)*np.sqrt(ntr), rn, mask))
-        pre.sort(reverse=True)
-        eligible=[(rn,mask) for _,rn,mask in pre[:SCREEN_KEEP]]
         t_start=_time.time(); fitted=0
-        log(f"SEARCH {tk}: {len(pre)} rules pass size gates; fitting CatBoost on top {len(eligible)} by TRAIN screen ...")
+        eligible=[(rn,mask) for rn,mask in R.items()]
+        log(f"SEARCH {tk}: scanning {len(eligible)} rules ...")
         for ri,(rn,mask) in enumerate(eligible):
             m=mask&ok; tr,va=m&(seg==0),m&(seg==1)
             if tr.sum()<3000 or va.sum()<600: continue
@@ -271,6 +257,16 @@ def main():
         scored.sort(reverse=True)
         print(f"\n========== {tk} — top-{TOPK} by VAL, TEST readout ==========")
         print(f"{'rule':<26}{'VAL%':>7} || {'TEST acc%':>10}{'n':>6}{'/day':>7}{'maxstrk':>8}{'3run%':>7}{'SE±':>5}")
+        os.makedirs('models', exist_ok=True)
+        winners=[]
+        for rank,(accv,rn,mod,mask) in enumerate(scored[:TOPK]):
+            mp=f"models/{tk}_rank{rank+1}.cbm"
+            mod.save_model(mp)
+            winners.append(dict(rank=rank+1, rule=rn, val_acc=round(accv*100,2), model=mp))
+        with open(f"models/{tk}_spec.json","w") as f:
+            json.dump(dict(target=tk, horizon=HORIZON, side="short", conf_tier="top40_of_short",
+                           features=feats, rules=winners), f, indent=1)
+        log(f"SAVED {tk}: {len(winners)} models + spec -> models/{tk}_spec.json")
         for accv,rn,mod,mask in scored[:TOPK]:
             m=mask&ok; te=m&(seg==2)
             if te.sum()<100:
@@ -282,6 +278,40 @@ def main():
             se=100*np.sqrt(max(win.mean()*(1-win.mean()),1e-9)/max(kq.sum(),1))
             days=(seg==2).sum()/1440
             print(f"{rn:<26}{accv*100:>7.2f} || {win.mean()*100:>10.2f}{kq.sum():>6}{kq.sum()/days:>7.1f}{mx:>8}{r3:>7.2f}{se:>5.1f}")
+            # ---- FULL CONFIDENCE SWEEP on TEST: model P(down) threshold 51..60% in 1% steps ----
+            print(f"    conf sweep [{rn}]: P(down)>=thr -> acc | n | /day | maxstrk | 3run%")
+            pd_down = 1.0 - p          # model probability of DOWN
+            for thr in [0.51,0.52,0.53,0.54,0.55,0.56,0.57,0.58,0.59,0.60]:
+                kk = pd_down >= thr
+                if kk.sum() < 40:
+                    print(f"      thr {int(thr*100)}%: n<{40} — stop"); break
+                w2=(y[te][kk]==0); mx2,r32=stk(~w2)
+                se2=100*np.sqrt(max(w2.mean()*(1-w2.mean()),1e-9)/kk.sum())
+                print(f"      thr {int(thr*100)}%: acc {w2.mean()*100:5.2f}% ±{se2:.1f} | n {kk.sum():>5} | {kk.sum()/days:>5.1f}/day | maxstrk {mx2:>2} | 3run {r32:.2f}%")
+        # ---- FULL COHORT: every rule with VAL >= 55%, TEST one-liners (sorted by VAL) ----
+        cohort=[s for s in scored if s[0]>=0.55]
+        if cohort:
+            days=(seg==2).sum()/1440
+            print(f"\n---- {tk}: ALL {len(cohort)} rules with VAL>=55% — TEST readout (sorted by VAL) ----")
+            print(f"{'rule':<26}{'VAL%':>7}{'TEST%':>8}{'n':>6}{'SE±':>5}")
+            t_accs=[]; t_ns=[]
+            for accv,rn,mod,mask in cohort:
+                m=mask&ok; te=m&(seg==2)
+                if te.sum()<100: continue
+                p=mod.predict_proba(F[te][feats])[:,1]
+                sh=p<0.5
+                if sh.sum()<50: continue
+                conf=0.5-p[sh]; kq=conf>=np.quantile(conf,0.6)
+                acc_t=(y[te][sh][kq]==0).mean()
+                se=100*np.sqrt(max(acc_t*(1-acc_t),1e-9)/max(kq.sum(),1))
+                t_accs.append(acc_t); t_ns.append(kq.sum())
+                print(f"{rn:<26}{accv*100:>7.2f}{acc_t*100:>8.2f}{kq.sum():>6}{se:>5.1f}")
+            if t_accs:
+                wavg=np.average(t_accs, weights=t_ns)
+                print(f"COHORT SUMMARY {tk}: {len(t_accs)} rules | weighted-mean TEST {wavg*100:.2f}% | median {np.median(t_accs)*100:.2f}% | best {max(t_accs)*100:.2f}%")
+                print(f"NOTE: the MEAN/MEDIAN above is the honest estimate of this family's live edge.")
+                print(f"NOTE: the BEST cell is max-of-{len(t_accs)} — picking it by TEST makes its number invalid.")
+                print(f"NOTE: to deploy, choose by VAL rank; TEST only confirms the cohort, never picks the winner.")
     print("\nTEST readout complete. These numbers are the truth. Rerunning with new")
     print("rules/settings after seeing them burns the TEST month — wait for a fresh month.")
 
