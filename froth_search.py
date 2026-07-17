@@ -47,6 +47,7 @@ TICKERS  = ['BTCUSDT','ETHUSDT','SOLUSDT','DOGEUSDT']
 TKEY     = {'BTCUSDT':'B','ETHUSDT':'E','SOLUSDT':'S','DOGEUSDT':'G'}
 HORIZON  = 5            # minutes ahead (target = close[t+H] vs close[t])
 TOPK     = 3            # rules reported per target
+ENS_K    = 5            # ensemble: top-K by VAL for combined-coverage analysis
 MAX_RULES= 500          # rule pool cap
 ITER     = 120          # catboost iterations
 DATA_DIR = 'binance_data'
@@ -315,6 +316,38 @@ def main():
                 print(f"NOTE: the MEAN/MEDIAN above is the honest estimate of this family's live edge.")
                 print(f"NOTE: the BEST cell is max-of-{len(t_accs)} — picking it by TEST makes its number invalid.")
                 print(f"NOTE: to deploy, choose by VAL rank; TEST only confirms the cohort, never picks the winner.")
+        # ---- ENSEMBLE / UNIQUE COVERAGE: top ENS_K rules by VAL, combined on TEST ----
+        ens = scored[:ENS_K]
+        if len(ens) >= 2:
+            days=(seg==2).sum()/1440
+            te_glob = ok & (seg==2)
+            te_idx = np.where(te_glob)[0]
+            fires = np.zeros((len(ens), len(te_idx)), bool)
+            for i,(accv,rn,mod,mask) in enumerate(ens):
+                mrows = mask[te_idx]
+                if mrows.sum()==0: continue
+                pp = mod.predict_proba(F.iloc[te_idx[mrows]][feats])[:,1]
+                shp = pp<0.5
+                if shp.sum()<30: continue
+                thr = np.quantile(0.5-pp[shp], 0.6)
+                loc = np.where(mrows)[0]
+                fires[i, loc] = (pp<0.5) & ((0.5-pp)>=thr)
+            nf = fires.sum(0)
+            uni = nf>=1
+            ytest = y[te_idx]
+            print(f"\n---- {tk}: ENSEMBLE of top-{len(ens)} VAL rules — unique coverage on TEST ----")
+            print(f"{'rule':<26}{'fires':>7}{'/day':>7}{'acc%':>7}{'UNIQUE n':>9}{'uniq acc%':>10}")
+            for i,(accv,rn,mod,mask) in enumerate(ens):
+                k = fires[i]
+                if k.sum()==0: continue
+                only = k & (nf==1)
+                ua = (ytest[only]==0).mean()*100 if only.sum()>30 else float('nan')
+                print(f"{rn:<26}{k.sum():>7}{k.sum()/days:>7.1f}{(ytest[k]==0).mean()*100:>7.2f}{only.sum():>9}{ua:>10.2f}")
+            print(f"{'UNION (any rule fires)':<26}{uni.sum():>7}{uni.sum()/days:>7.1f}{(ytest[uni]==0).mean()*100:>7.2f}")
+            for kmin in [2,3]:
+                agree = nf>=kmin
+                if agree.sum()>40:
+                    print(f"{'AGREE >='+str(kmin)+' rules':<26}{agree.sum():>7}{agree.sum()/days:>7.1f}{(ytest[agree]==0).mean()*100:>7.2f}")
     print("\nTEST readout complete. These numbers are the truth. Rerunning with new")
     print("rules/settings after seeing them burns the TEST month — wait for a fresh month.")
 
