@@ -43,11 +43,11 @@ def log(msg):
     print(f"[{el/60:6.1f}m] {msg}", flush=True)
 
 # ----------------------------- CONFIG -----------------------------
-TICKERS  = ['BTCUSDT','ETHUSDT','SOLUSDT','DOGEUSDT','BNBUSDT','XRPUSDT']
-TKEY     = {'BTCUSDT':'B','ETHUSDT':'E','SOLUSDT':'S','DOGEUSDT':'G','BNBUSDT':'N','XRPUSDT':'X'}
+TICKERS  = ['BTCUSDT','ETHUSDT','SOLUSDT','DOGEUSDT']
+TKEY     = {'BTCUSDT':'B','ETHUSDT':'E','SOLUSDT':'S','DOGEUSDT':'G'}
 HORIZON  = 5            # minutes ahead (target = close[t+H] vs close[t])
 TOPK     = 3            # rules reported per target
-MAX_RULES= 250          # cap on rule pool (exhaustive within cap)
+MAX_RULES= 500          # rule pool cap
 ITER     = 120          # catboost iterations
 DATA_DIR = 'binance_data'
 BARS_DIR = 'bars_cache'
@@ -180,6 +180,9 @@ def rule_pool(P, train_mask):
         prims[f'{k}brk10']=bk10[k]; prims[f'{k}vol']=bv[k]
         thr = np.nanpercentile(mom5[k][train_mask], 90)   # TRAIN-ONLY calibration
         prims[f'{k}hot']=mom5[k]>thr
+        prims[f'{k}up2']=up[k]&lag(up[k],1)                # two consecutive up closes
+        thr_c = np.nanpercentile(mom5[k][train_mask], 10)
+        prims[f'{k}cold']=mom5[k]<thr_c                    # bottom-decile momentum
     n_up  = sum(up[k].astype(int) for k in P)
     n_brk = sum(bk[k].astype(int) for k in P)
     n_vol = sum(bv[k].astype(int) for k in P)
