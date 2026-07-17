@@ -229,7 +229,9 @@ def main():
     if len(uniq)<4: sys.exit("need >=4 months for train/val/test")
     VAL_M, TEST_M = uniq[-2], uniq[-1]
     seg = np.where(ym==TEST_M,2,np.where(ym==VAL_M,1,0))
+    bnd = (mins % 5) == 0        # clock-aligned 5m boundaries (:00,:05,...) — live decision points
     print(f"\nmonths: {uniq}  TRAIN={uniq[:-2]}  VAL={VAL_M}  TEST={TEST_M}")
+    print(f"VAL/TEST evaluated ONLY at 5m clock boundaries (min%5==0) to replicate live contracts; TRAIN uses all 1m rows.")
     F = features(P, mins); feats=list(F.columns)
     R = rule_pool(P, seg==0)
     print(f"rule pool: {len(R)}  horizon: {HORIZON}m  rows: {n}")
@@ -244,14 +246,14 @@ def main():
         eligible=[(rn,mask) for rn,mask in R.items()]
         log(f"SEARCH {tk}: scanning {len(eligible)} rules ...")
         for ri,(rn,mask) in enumerate(eligible):
-            m=mask&ok; tr,va=m&(seg==0),m&(seg==1)
-            if tr.sum()<3000 or va.sum()<600: continue
+            m=mask&ok; tr,va=m&(seg==0),m&(seg==1)&bnd
+            if tr.sum()<3000 or va.sum()<150: continue
             mod=CatBoostClassifier(iterations=ITER,depth=4,learning_rate=0.07,
                                    l2_leaf_reg=8,random_seed=7,verbose=0)
             mod.fit(F[tr][feats],y[tr])
             p=mod.predict_proba(F[va][feats])[:,1]
             sh=p<0.5
-            if sh.sum()<300: continue
+            if sh.sum()<80: continue
             conf=0.5-p[sh]; kq=conf>=np.quantile(conf,0.6)
             accv=(y[va][sh][kq]==0).mean()
             scored.append((accv, rn, mod, mask))
@@ -272,8 +274,8 @@ def main():
                            features=feats, rules=winners), f, indent=1)
         log(f"SAVED {tk}: {len(winners)} models + spec -> models/{tk}_spec.json")
         for accv,rn,mod,mask in scored[:TOPK]:
-            m=mask&ok; te=m&(seg==2)
-            if te.sum()<100:
+            m=mask&ok; te=m&(seg==2)&bnd
+            if te.sum()<60:
                 print(f"{rn:<26}{accv*100:>7.2f} || too few TEST rows"); continue
             p=mod.predict_proba(F[te][feats])[:,1]
             sh=p<0.5; conf=0.5-p[sh]
@@ -300,11 +302,11 @@ def main():
             print(f"{'rule':<26}{'VAL%':>7}{'TEST%':>8}{'n':>6}{'SE±':>5}")
             t_accs=[]; t_ns=[]
             for accv,rn,mod,mask in cohort:
-                m=mask&ok; te=m&(seg==2)
-                if te.sum()<100: continue
+                m=mask&ok; te=m&(seg==2)&bnd
+                if te.sum()<60: continue
                 p=mod.predict_proba(F[te][feats])[:,1]
                 sh=p<0.5
-                if sh.sum()<50: continue
+                if sh.sum()<40: continue
                 conf=0.5-p[sh]; kq=conf>=np.quantile(conf,0.6)
                 acc_t=(y[te][sh][kq]==0).mean()
                 se=100*np.sqrt(max(acc_t*(1-acc_t),1e-9)/max(kq.sum(),1))
@@ -320,7 +322,7 @@ def main():
         ens = scored[:ENS_K]
         if len(ens) >= 2:
             days=(seg==2).sum()/1440
-            te_glob = ok & (seg==2)
+            te_glob = ok & (seg==2) & bnd
             te_idx = np.where(te_glob)[0]
             fires = np.zeros((len(ens), len(te_idx)), bool)
             for i,(accv,rn,mod,mask) in enumerate(ens):
