@@ -47,8 +47,9 @@ TICKERS  = ['BTCUSDT','ETHUSDT','SOLUSDT','DOGEUSDT','BNBUSDT','XRPUSDT']
 TKEY     = {'BTCUSDT':'B','ETHUSDT':'E','SOLUSDT':'S','DOGEUSDT':'G','BNBUSDT':'N','XRPUSDT':'X'}
 HORIZON  = 5            # minutes ahead (target = close[t+H] vs close[t])
 TOPK     = 3            # rules reported per target
-MAX_RULES= 250          # cap on rule pool (exhaustive within cap)
+MAX_RULES= 10**9        # FULL EXHAUSTIVE — no cap
 ITER     = 120          # catboost iterations
+SCREEN_KEEP = 600       # after raw TRAIN screen, fit CatBoost on this many rules (set 10**9 to disable screening)
 DATA_DIR = 'binance_data'
 BARS_DIR = 'bars_cache'
 BASE_URL = 'https://data.binance.vision/data/spot/monthly/aggTrades'
@@ -203,6 +204,10 @@ def rule_pool(P, train_mask):
         for k in P:
             if len(R)>=MAX_RULES: break
             R[f'{cn}&{k}up']=R[cn]&up[k]
+    # AND-triples (full exhaustive tier)
+    for a,b,c in itertools.combinations(base,3):
+        if len(R)>=MAX_RULES: break
+        R[f'{a}&{b}&{c}']=prims[a]&prims[b]&prims[c]
     return R
 
 # --------------------------- SEARCH ---------------------------
@@ -236,9 +241,18 @@ def main():
         y=np.where(fwd>TC,1,np.where(fwd<TC,0,-1))
         ok=okbase&(y>=0)
         scored=[]
+        # --- raw screen on TRAIN ONLY: rank rules by |short-accuracy - 0.5| with no model; VAL untouched ---
+        pre=[]
+        for rn,mask in R.items():
+            m=mask&ok; tr=m&(seg==0)
+            ntr=tr.sum()
+            if ntr<3000 or (m&(seg==1)).sum()<600: continue
+            raw=(y[tr]==0).mean()
+            pre.append((abs(raw-0.5)*np.sqrt(ntr), rn, mask))
+        pre.sort(reverse=True)
+        eligible=[(rn,mask) for _,rn,mask in pre[:SCREEN_KEEP]]
         t_start=_time.time(); fitted=0
-        eligible=[(rn,mask) for rn,mask in R.items()]
-        log(f"SEARCH {tk}: scanning {len(eligible)} rules ...")
+        log(f"SEARCH {tk}: {len(pre)} rules pass size gates; fitting CatBoost on top {len(eligible)} by TRAIN screen ...")
         for ri,(rn,mask) in enumerate(eligible):
             m=mask&ok; tr,va=m&(seg==0),m&(seg==1)
             if tr.sum()<3000 or va.sum()<600: continue
