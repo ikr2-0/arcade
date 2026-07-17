@@ -36,6 +36,12 @@ try:
 except ImportError:
     sys.exit("pip install catboost")
 
+import time as _time
+_T0 = _time.time()
+def log(msg):
+    el = _time.time() - _T0
+    print(f"[{el/60:6.1f}m] {msg}", flush=True)
+
 # ----------------------------- CONFIG -----------------------------
 TICKERS  = ['BTCUSDT','ETHUSDT','SOLUSDT','DOGEUSDT','BNBUSDT','XRPUSDT']
 TKEY     = {'BTCUSDT':'B','ETHUSDT':'E','SOLUSDT':'S','DOGEUSDT':'G','BNBUSDT':'N','XRPUSDT':'X'}
@@ -63,12 +69,17 @@ def download(sym, y, m):
     if os.path.exists(path) and os.path.getsize(path) > 1e6:
         return path
     url = f"{BASE_URL}/{sym}/{fn}"
-    print(f"  downloading {fn} ...")
+    log(f"DOWNLOAD start {fn}")
     r = requests.get(url, stream=True, timeout=120)
     if r.status_code != 200:
-        print(f"  !! {url} -> HTTP {r.status_code} (month may not exist yet)"); return None
+        log(f"!! {fn} -> HTTP {r.status_code} (month not published yet, skipping)"); return None
+    total = int(r.headers.get('content-length', 0)) / 1e6
+    done = 0
     with open(path,'wb') as f:
-        for chunk in r.iter_content(1<<20): f.write(chunk)
+        for chunk in r.iter_content(1<<22):
+            f.write(chunk); done += len(chunk)/1e6
+            if int(done) % 50 < 4: log(f"  {fn}: {done:.0f}/{total:.0f} MB")
+    log(f"DOWNLOAD done {fn} ({done:.0f} MB)")
     return path
 
 def zip_to_bars(path):
@@ -76,9 +87,10 @@ def zip_to_bars(path):
     Timestamps may be ms (13 digit) or us (16 digit)."""
     os.makedirs(BARS_DIR, exist_ok=True)
     out = os.path.join(BARS_DIR, os.path.basename(path).replace('.zip','_1m.parquet'))
-    if os.path.exists(out): return out
-    print(f"  processing {os.path.basename(path)} ...")
-    parts=[]
+    if os.path.exists(out):
+        log(f"CACHED {os.path.basename(out)}"); return out
+    log(f"PROCESS start {os.path.basename(path)}")
+    parts=[]; nch=0
     with zipfile.ZipFile(path) as z:
         name = z.namelist()[0]
         with z.open(name) as f:
@@ -95,6 +107,8 @@ def zip_to_bars(path):
                     'open':g['price'].first(),'high':g['price'].max(),
                     'low':g['price'].min(),'close':g['price'].last(),
                     'vol':g['qty'].sum(),'tb':g['tb'].sum(),'n':g['qty'].size()}))
+                nch += 1
+                log(f"  chunk {nch} ({nch*5}M trades) -> {sum(len(p) for p in parts)} partial minute-rows")
     b = pd.concat(parts)
     # merge minutes split across chunk boundaries
     g = b.groupby(level=0)
@@ -102,6 +116,7 @@ def zip_to_bars(path):
                          'close':g['close'].last(),'vol':g['vol'].sum(),'tb':g['tb'].sum(),'n':g['n'].sum()})
     bars.index.name='minute'
     bars.reset_index().to_parquet(out)
+    log(f"PROCESS done {os.path.basename(out)}: {len(bars)} 1m bars")
     return out
 
 # --------------------------- ASSEMBLE ---------------------------
@@ -116,7 +131,7 @@ def build(n_months):
             frames.append(pd.read_parquet(zip_to_bars(p)))
         df = pd.concat(frames, ignore_index=True)
         per_tk[TKEY[sym]] = df
-        print(f"{sym}: {len(df)} 1m bars")
+        log(f"ASSEMBLED {sym}: {len(df)} 1m bars")
     # align on common minute index (inner join)
     common = None
     for k,df in per_tk.items():
@@ -221,7 +236,10 @@ def main():
         y=np.where(fwd>TC,1,np.where(fwd<TC,0,-1))
         ok=okbase&(y>=0)
         scored=[]
-        for rn,mask in R.items():
+        t_start=_time.time(); fitted=0
+        eligible=[(rn,mask) for rn,mask in R.items()]
+        log(f"SEARCH {tk}: scanning {len(eligible)} rules ...")
+        for ri,(rn,mask) in enumerate(eligible):
             m=mask&ok; tr,va=m&(seg==0),m&(seg==1)
             if tr.sum()<3000 or va.sum()<600: continue
             mod=CatBoostClassifier(iterations=ITER,depth=4,learning_rate=0.07,
@@ -231,7 +249,11 @@ def main():
             sh=p<0.5
             if sh.sum()<300: continue
             conf=0.5-p[sh]; kq=conf>=np.quantile(conf,0.6)
-            scored.append(((y[va][sh][kq]==0).mean(), rn, mod, mask))
+            accv=(y[va][sh][kq]==0).mean()
+            scored.append((accv, rn, mod, mask))
+            fitted+=1
+            per=(_time.time()-t_start)/fitted
+            log(f"  {tk} rule {ri+1}/{len(eligible)} fitted#{fitted} [{rn}] val={accv*100:.2f}%  (~{per:.1f}s/rule, ETA {(len(eligible)-ri-1)*per/60:.0f}m)")
         scored.sort(reverse=True)
         print(f"\n========== {tk} — top-{TOPK} by VAL, TEST readout ==========")
         print(f"{'rule':<26}{'VAL%':>7} || {'TEST acc%':>10}{'n':>6}{'/day':>7}{'maxstrk':>8}{'3run%':>7}{'SE±':>5}")
